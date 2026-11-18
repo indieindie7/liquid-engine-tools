@@ -6,7 +6,7 @@ import sys, struct, json
 MARK = 0xdeadd00d
 MARKB = struct.pack('<I', MARK)
 PRIM = {'uint': 'I', 'int': 'i', 'float': 'f', 'bool': 'B', 'u8': 'B', 'i8': 'b', 'u16': 'H', 'i16': 'h', 'i64': 'q', 'u64': 'Q',
-        'Vector': '4f', 'Vector3': '3f', 'Vector2': '2f', 'Quaternion': '4f', 'HDRColor': '4f', 'Matrix': '16f', 'BoundingBox4': '8f', 'SimpleGUID': '16B'}
+        'Vector': '4f', 'Vector3': '3f', 'Vector2': '2f', 'Quaternion': '4f', 'HDRColor': '4Bf', 'Matrix': '16f', 'BoundingBox4': '8f', 'SimpleGUID': '16B'}
 BASE_LAST = set()  # classes whose base properties are stored after their own (found per data set by twomscan)
 MANGLED = {'M': 'float', 'H': 'int', 'I': 'uint', 'G': 'u16', 'E': 'u8', '_N': 'bool', 'F': 'i16', 'D': 'i8'}
 ERRS = (ValueError, struct.error, IndexError, RecursionError, UnicodeDecodeError)
@@ -37,7 +37,11 @@ class Reader:
         e = s.d.index(b'\0', s.p); v = s.d[s.p:e].decode('cp1250'); s.p = e + 1
         return v
     def prim(s, t):
-        if t in ('NameString', 'cstr'): return s.name()
+        if t == 'NameString': return s.name()
+        if t == 'cstr':  # tagged like NameString, or (ProjectConfig) a bare zero-terminated string
+            if s.d[s.p] in (0, 1): return s.name()
+            e = s.d.index(bytes(1), s.p); v = s.d[s.p:e].decode('latin1'); s.p = e + 1  # latin1: group rows hold junk bytes here
+            return v
         t = MANGLED.get(t, t)
         if t not in PRIM: raise ValueError('unknown primitive %s at %x' % (t, s.p))
         v = s.u(PRIM[t])
@@ -63,12 +67,14 @@ class Reader:
     def poly_start(s, strict=False):
         """True when a polymorphic element starts at the cursor: the name of a known class, or (not strict) an empty one."""
         if s.p >= len(s.d) or s.d[s.p] == 0: return not strict
+        if s.d[s.p:s.p + 2] == bytes((1, 0)): return True  # tagged empty name = declared class
         e = s.d.find(bytes(1), s.p + 1, s.p + 120)
         return s.d[s.p] == 1 and e > 0 and s.d[s.p + 1:e].decode('latin1') in s.cls
-    def poly(s, more=False):
+    def poly(s, more=False, decl=None):
         """Class name then object. more = another element follows: when no class name starts right after
         this one, the other base block order is tried and kept if it does end on a class name."""
-        c = s.name()
+        t0 = s.d[s.p]; c = s.name()
+        if not c and t0 == 1 and decl in s.cls: c = decl  # tagged empty name = the declared class itself
         if not c: return None
         if c not in s.cls: raise ValueError('unknown poly class %s at %x' % (c, s.p))
         p0 = s.p
@@ -87,15 +93,23 @@ class Reader:
         return o
     def value(s, c, name, t):
         k, _, a = t.partition('<'); a = a.rstrip('>')
-        if k == 'DA': return s.prim(a)
+        if k == 'RTTISGProperty' and a.startswith('PEAD@'): return s.prim('cstr')  # getter returning char* (ShaderParameterDefinition.Register)
+        if k in ('DA', 'RTTISGProperty', 'RTTIAutoProperty'): return s.prim(a)  # SG/Auto = getter/setter of a plain value
         if k == 'Dyn': return [s.prim(a) for _ in range(s.count())]
-        if k in ('DynObj', 'DynObjPtr'): return [s.obj(a, s.marked()) for _ in range(s.count())]
+        if k == 'DynObj': return [s.obj(a, s.marked()) for _ in range(s.count())]
+        if k == 'DynObjPtr': return [s.ptr(a) for _ in range(s.count())]
         if k == 'Obj': return s.obj(a, s.marked())
-        if k == POLY1: return s.poly()
+        if k == POLY1: return s.poly(decl=a)
         if k == POLYN:
             n = s.count()
-            return [s.poly(i < n - 1) for i in range(n)]
+            return [s.poly(i < n - 1, a) for i in range(n)]
         raise ValueError('unhandled type %r for %s.%s at %x' % (t, c, name, s.p))
+    def ptr(s, a):
+        """Pointer element: u8 1 = object follows, 0 = null."""
+        f = s.d[s.p]; s.p += 1
+        if f == 0: return None
+        if f != 1: raise ValueError('pointer flag %d at %x' % (f, s.p - 1))
+        return s.obj(a, s.marked())
     def base_chain(s, c):
         """c and its bases, as far as each one registers a base block."""
         out = []
@@ -140,6 +154,20 @@ def parse(d, cls, bases, top, skip, trace=False, start=4):
         return None, r.p, str(e)
     return res, r.p, ''
 
+def parse_sized(d, cls, bases, c, skip, trace=False, head=12):
+    """Sized list layout (shader families 7f0a0401): head bytes, u32 count, then per element u32 byte size + object.
+    Every element must end exactly on its size."""
+    r = Reader(d, cls, bases, skip, trace); r.p = head
+    try:
+        out = []
+        for _ in range(r.count()):
+            sz = r.u('I'); p0 = r.p
+            out.append(r.obj(c, r.marked()))
+            if r.p != p0 + sz: raise ValueError('element ends at %x, size says %x' % (r.p, p0 + sz))
+    except ERRS as e:
+        return None, r.p, str(e)
+    return {'_head': d[:head].hex(), '_sized_list': out}, r.p, ''
+
 def find_top(d, cls, bases, tops, skip, trace=False):
     """First class whose parse lands on the file end; size prefix (start 4) tried before none (start 0)."""
     last = (None, 0, 'no class')
@@ -151,6 +179,9 @@ def find_top(d, cls, bases, tops, skip, trace=False):
             if not got: BASE_LAST.clear(); BASE_LAST.update(before)
             if got and end == len(d): return c, got, end, ''
             last = (c, end, err)
+    for c in tops:
+        got, end, err = parse_sized(d, cls, bases, c, skip, trace)
+        if got and got['_sized_list'] and end == len(d): return c + '[]', got, end, ''
     return last[0], None, last[1], last[2] or 'short'
 
 def parse_args(argv):
